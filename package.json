@@ -1,0 +1,37 @@
+{
+  "name": "defai-staking-ton",
+  "version": "1.0.0",
+  "description": "DeFAI Staking Contract for TON Blockchain",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "compile": "func -o build/defai_staking.fif -SPA defai_staking.fc",
+    "build": "npm run compile"
+  },
+  "keywords": [
+    "ton",
+    "blockchain",
+    "staking",
+    "defai",
+    "func"
+  ],
+  "author": "DeFAI",
+  "license": "MIT",
+  "devDependencies": {
+    "@ton/core": "^0.56.0",
+    "@ton/crypto": "^3.2.0",
+    "@ton/sandbox": "^0.20.0",
+    "@ton/test-utils": "^0.4.0",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.24",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@ton/ton": "^13.11.0"
+  }
+}

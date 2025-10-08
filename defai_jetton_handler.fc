@@ -1,0 +1,192 @@
+#pragma version >=0.4.0;
+
+;; DeFAI Staking Jetton Handler Contract
+;; Handles jetton transfers for staking, unstaking, and rewards
+
+#include "defai_staking.fc";
+
+;; ==================== JETTON CONSTANTS ====================
+
+;; Standard jetton opcodes
+const int jetton_transfer = 0xf8a7ea5;
+const int jetton_transfer_notification = 0x7362d09c;
+const int jetton_excesses = 0xd53276db;
+const int jetton_burn = 0x595f07bc;
+
+;; Custom jetton staking opcodes  
+const int jetton_stake_notification = 0x53544b45;     ;; "STKE"
+const int jetton_unstake_request = 0x554e5354;        ;; "UNST"
+const int jetton_reward_claim = 0x52455744;           ;; "REWD"
+
+;; ==================== JETTON TRANSFER HANDLERS ====================
+
+() handle_jetton_transfer_notification(slice sender_addr, slice in_msg_body) impure {
+    ;; Parse jetton transfer notification
+    int query_id = in_msg_body~load_uint(64);
+    int jetton_amount = in_msg_body~load_coins();
+    slice from_addr = in_msg_body~load_msg_addr();
+    
+    ;; Check if we have forward payload
+    if (in_msg_body.slice_refs() == 0) {
+        ;; No forward payload, treat as escrow funding
+        handle_fund_escrow(from_addr, jetton_amount, query_id);
+        return ();
+    }
+    
+    cell forward_payload = in_msg_body~load_ref();
+    slice forward_slice = forward_payload.begin_parse();
+    
+    if (forward_slice.slice_bits() < 32) {
+        ;; Invalid forward payload, treat as escrow funding
+        handle_fund_escrow(from_addr, jetton_amount, query_id);
+        return ();
+    }
+    
+    int forward_op = forward_slice~load_uint(32);
+    
+    if (forward_op == jetton_stake_notification) {
+        ;; User is staking tokens
+        handle_stake(from_addr, jetton_amount, query_id);
+        return ();
+    }
+    
+    ;; Default: treat as escrow funding
+    handle_fund_escrow(from_addr, jetton_amount, query_id);
+}
+
+() send_jetton_transfer(slice to_addr, slice jetton_wallet_addr, int amount, 
+                        int query_id, cell forward_payload, int forward_ton_amount) impure {
+    var msg_body = begin_cell()
+        .store_uint(jetton_transfer, 32)
+        .store_uint(query_id, 64)
+        .store_coins(amount)
+        .store_slice(to_addr)
+        .store_slice(to_addr)  ;; response_destination
+        .store_dict(null())     ;; custom_payload
+        .store_coins(forward_ton_amount)
+        .store_maybe_ref(forward_payload);
+        
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(jetton_wallet_addr)
+        .store_coins(100000000) ;; 0.1 TON for gas
+        .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_ref(msg_body.end_cell());
+        
+    send_raw_message(msg.end_cell(), 1);
+}
+
+() process_unstake_with_jetton_transfer(slice user_addr, int amount, int penalty, 
+                                        slice jetton_wallet, int query_id) impure {
+    int amount_to_transfer = amount - penalty;
+    
+    ;; Send jettons back to user
+    send_jetton_transfer(
+        user_addr,
+        jetton_wallet,
+        amount_to_transfer,
+        query_id,
+        begin_cell().store_uint(0, 32).end_cell(), ;; Empty forward payload
+        1000000 ;; 0.001 TON forward amount
+    );
+}
+
+() process_reward_claim_with_jetton_transfer(slice user_addr, int reward_amount,
+                                             slice jetton_wallet, int query_id) impure {
+    ;; Send reward jettons to user
+    send_jetton_transfer(
+        user_addr,
+        jetton_wallet,
+        reward_amount,
+        query_id,
+        begin_cell()
+            .store_uint(jetton_reward_claim, 32)
+            .store_uint(reward_amount, 124)
+            .end_cell(),
+        1000000 ;; 0.001 TON forward amount
+    );
+}
+
+;; ==================== JETTON WALLET DISCOVERY ====================
+
+(slice) get_jetton_wallet_address(slice owner_addr, slice jetton_master_addr, cell jetton_wallet_code) method_id {
+    cell state_init = begin_cell()
+        .store_uint(0, 2)
+        .store_dict(jetton_wallet_code)
+        .store_dict(begin_cell()
+            .store_slice(owner_addr)
+            .store_slice(jetton_master_addr)
+            .end_cell())
+        .store_uint(0, 1)
+        .end_cell();
+        
+    return begin_cell()
+        .store_uint(4, 3)
+        .store_int(0, 8)  ;; workchain
+        .store_uint(cell_hash(state_init), 256)
+        .end_cell()
+        .begin_parse();
+}
+
+;; ==================== ENHANCED MESSAGE RECEIVER ====================
+
+() recv_internal_jetton(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+    
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    
+    if (flags & 1) { ;; Ignore bounced messages
+        return ();
+    }
+    
+    slice sender_addr = cs~load_msg_addr();
+    int op = in_msg_body~load_uint(32);
+    
+    ;; Handle jetton-specific operations
+    if (op == jetton_transfer_notification) {
+        handle_jetton_transfer_notification(sender_addr, in_msg_body);
+        return ();
+    }
+    
+    if (op == jetton_excesses) {
+        ;; Handle excess jettons (returned from failed transfers)
+        return ();
+    }
+    
+    ;; Forward to main contract receiver for standard operations
+    recv_internal(msg_value, in_msg_full, in_msg_body);
+}
+
+;; ==================== JETTON BALANCE QUERY ====================
+
+(int) get_jetton_balance(slice jetton_wallet_addr) method_id {
+    ;; Query jetton wallet for balance
+    ;; This is a simplified version - in production, you'd need to handle async queries
+    var msg = begin_cell()
+        .store_uint(0x10, 6) ;; nobounce
+        .store_slice(jetton_wallet_addr)
+        .store_coins(0)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(0x0f8a7ea5, 32) ;; get_balance opcode
+        .store_uint(0, 64); ;; query_id
+        
+    ;; In production, this would be an async call
+    ;; For now, return the stored vault balance
+    (_, _, _, _, _, _, _, _, _, _, _, int vault_balance) = load_data();
+    return vault_balance;
+}
+
+;; ==================== JETTON METADATA ====================
+
+(cell) get_jetton_metadata() method_id {
+    cell metadata = begin_cell()
+        .store_uint(0, 8) ;; metadata tag
+        .store_slice("DeFAI Staking Vault")
+        .store_slice("DSV")
+        .store_uint(9, 8) ;; decimals
+        .end_cell();
+    return metadata;
+}

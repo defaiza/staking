@@ -1,0 +1,109 @@
+#!/usr/bin/fift -s
+"TonUtil.fif" include
+"Asm.fif" include
+
+// DeFAI Staking Contract Deployment Script
+
+// Parse command line arguments
+{ ."usage: " @' $0 type ." <workchain-id> <jetton-wallet-address> [<filename-base>]" cr
+  ."Creates a new DeFAI Staking smart contract in specified workchain." cr
+  ."Jetton wallet address should be the contract's jetton wallet for DEFAI tokens." cr cr
+  ."Example: " @' $0 type ." 0 EQD... defai-staking" cr
+  1 halt
+} : usage
+
+$# 2 < ' usage if
+$# 3 > ' usage if
+
+$1 parse-int =: workchain
+$2 =: jetton_wallet_addr_str
+$# 3 = { $3 } { "defai-staking" } cond =: filename-base
+
+// Convert jetton wallet address from string to address
+jetton_wallet_addr_str $>smca 0= abort"Invalid jetton wallet address"
+=: jetton_wallet_bounce
+=: jetton_wallet_addr
+
+// Initialize storage
+<b 
+  0 1 u,                    // initialized = false
+  0 1 u,                    // paused = false  
+  0 32 u,                   // total_users = 0
+  0 124 u,                  // total_staked = 0
+  0 addr,                   // authority = 0 (will be set on init)
+  jetton_wallet_addr addr,  // defai_jetton_wallet
+  0 1 u,                    // has_pending = false
+  0 addr,                   // pending_authority = 0
+  0 64 u,                   // authority_timestamp = 0
+  0 124 u,                  // escrow_balance = 0
+  0 124 u,                  // escrow_distributed = 0
+  0 124 u,                  // vault_balance = 0
+  dictnew dict,             // empty user stakes dictionary
+b> =: init_storage
+
+// Load contract code
+"defai_staking.fc" include =: contract_code
+
+// Create StateInit
+<b
+  b{00110} s,             // split_depth:Nothing, special:Nothing, code:Just
+  contract_code ref,       // code cell
+  b{010} s,               // data:Just
+  init_storage ref,        // data cell
+  b{0} s,                 // library:Nothing
+b> =: state_init
+
+// Calculate contract address
+workchain state_init hashu 2constant contract_addr
+contract_addr .addr cr
+
+// Create deployment message
+<b
+  b{1000100} s,           // ext_in_msg_info$10, ihr_disabled:1, bounce:0, bounced:0
+  b{00} s,                // src:addr_none$00
+  contract_addr addr,     // dest
+  0 Gram,                 // import_fee
+  b{10} s,                // state_init:Just, body:(Left)
+  state_init <s s,        // state_init
+  0 32 u,                 // empty body for deployment
+b>
+
+2 boc+>B filename-base +"-deploy.boc" tuck B>file
+."Deployment message saved to " type cr
+
+// Save contract info
+contract_addr filename-base +".addr" save-address-verbose
+."Contract address saved to " filename-base type .".addr" cr
+
+// Create initialization message
+<b
+  b{1000100} s,           // ext_in_msg_info
+  b{00} s,                // src:addr_none
+  contract_addr addr,     // dest  
+  0 Gram,                 // import_fee
+  0 1 u,                  // state_init:Nothing, body:(Right)
+  b{0} s,                 // body_ref:Nothing
+  0x5fcc3d14 32 u,        // op: initialize
+  0 64 u,                 // query_id
+  jetton_wallet_addr addr, // defai_jetton_wallet for initialization
+b>
+
+2 boc+>B filename-base +"-init.boc" tuck B>file
+."Initialization message saved to " type cr
+
+// Display contract information
+."" cr
+."=== DeFAI Staking Contract Deployment Info ===" cr
+."Contract Address: " contract_addr .addr cr
+."Workchain: " workchain . cr
+."Jetton Wallet: " jetton_wallet_addr .addr cr
+."" cr
+."Deployment files created:" cr
+."  " filename-base type ."-deploy.boc - Deployment message" cr
+."  " filename-base type ."-init.boc - Initialization message" cr
+."  " filename-base type .".addr - Contract address" cr
+."" cr
+."Next steps:" cr
+."1. Send deployment message: lite-client -C send " filename-base type ."-deploy.boc" cr
+."2. Wait for contract deployment" cr
+."3. Send initialization message: lite-client -C send " filename-base type ."-init.boc" cr

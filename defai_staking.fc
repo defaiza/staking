@@ -1,0 +1,699 @@
+#pragma version >=0.4.0;
+
+;; DeFAI Staking Smart Contract for TON Blockchain
+;; Transpiled from Solana Rust implementation
+
+;; ==================== CONSTANTS ====================
+
+;; Staking Tiers (amounts in nanoDEFAI - 9 decimals)
+const int GOLD_MIN = 10000000000000000;      ;; 10M DEFAI
+const int GOLD_MAX = 99999999000000000;      ;; 99.99M DEFAI
+const int GOLD_APY_BPS = 50;                 ;; 0.5% = 50 basis points
+
+const int TITANIUM_MIN = 100000000000000000; ;; 100M DEFAI
+const int TITANIUM_MAX = 999999999000000000; ;; 999.99M DEFAI
+const int TITANIUM_APY_BPS = 75;             ;; 0.75% = 75 basis points
+
+const int INFINITE_MIN = 1000000000000000000; ;; 1B DEFAI
+const int INFINITE_APY_BPS = 100;             ;; 1% = 100 basis points
+
+;; Time constants
+const int SECONDS_PER_YEAR = 31536000;
+const int BASIS_POINTS = 10000;
+const int ADMIN_TIMELOCK_DURATION = 172800;  ;; 48 hours
+const int INITIAL_LOCK_PERIOD = 604800;       ;; 7 days
+
+;; Operation codes (opcodes for internal messages)
+const int op::initialize = 0x5fcc3d14;
+const int op::initialize_escrow = 0x2a4c7d8f;
+const int op::stake = 0x6d69747a;
+const int op::unstake = 0x756e7374;
+const int op::claim_rewards = 0x636c616d;
+const int op::compound_rewards = 0x636f6d70;
+const int op::fund_escrow = 0x66756e64;
+const int op::propose_authority = 0x70726f70;
+const int op::accept_authority = 0x61636370;
+const int op::pause = 0x70617573;
+const int op::unpause = 0x756e7073;
+const int op::emergency_withdraw = 0x656d6572;
+
+;; Error codes
+const int error::not_initialized = 101;
+const int error::already_initialized = 102;
+const int error::unauthorized = 103;
+const int error::amount_too_low = 104;
+const int error::insufficient_stake = 105;
+const int error::tokens_locked = 106;
+const int error::no_rewards = 107;
+const int error::program_paused = 108;
+const int error::insufficient_escrow = 109;
+const int error::invalid_tier = 110;
+const int error::timelock_active = 111;
+const int error::no_pending_authority = 112;
+const int error::invalid_mint = 113;
+const int error::overflow = 114;
+
+;; ==================== STORAGE LAYOUT ====================
+;; Storage schema:
+;; initialized:1bit paused:1bit total_users:32bit total_staked:124bit = 158 bits
+;; authority:256bit
+;; defai_jetton_wallet:256bit  
+;; pending_authority:257bit (1bit flag + 256bit address)
+;; authority_change_timestamp:64bit
+;; escrow_balance:124bit escrow_distributed:124bit = 248 bits
+;; stake_vault_balance:124bit
+
+;; ==================== STORAGE FUNCTIONS ====================
+
+() save_data(int initialized, int paused, int total_users, int total_staked,
+             slice authority, slice defai_jetton_wallet,
+             slice pending_authority, int has_pending, int authority_timestamp,
+             int escrow_balance, int escrow_distributed, int vault_balance) impure {
+    set_data(begin_cell()
+        .store_uint(initialized, 1)
+        .store_uint(paused, 1)
+        .store_uint(total_users, 32)
+        .store_uint(total_staked, 124)
+        .store_slice(authority)
+        .store_slice(defai_jetton_wallet)
+        .store_uint(has_pending, 1)
+        .store_slice(pending_authority)
+        .store_uint(authority_timestamp, 64)
+        .store_uint(escrow_balance, 124)
+        .store_uint(escrow_distributed, 124)
+        .store_uint(vault_balance, 124)
+        .end_cell());
+}
+
+(int, int, int, int, slice, slice, slice, int, int, int, int, int) load_data() {
+    slice ds = get_data().begin_parse();
+    int initialized = ds~load_uint(1);
+    int paused = ds~load_uint(1);
+    int total_users = ds~load_uint(32);
+    int total_staked = ds~load_uint(124);
+    slice authority = ds~load_msg_addr();
+    slice defai_jetton_wallet = ds~load_msg_addr();
+    int has_pending = ds~load_uint(1);
+    slice pending_authority = ds~load_msg_addr();
+    int authority_timestamp = ds~load_uint(64);
+    int escrow_balance = ds~load_uint(124);
+    int escrow_distributed = ds~load_uint(124);
+    int vault_balance = ds~load_uint(124);
+    
+    return (initialized, paused, total_users, total_staked, authority, 
+            defai_jetton_wallet, pending_authority, has_pending, 
+            authority_timestamp, escrow_balance, escrow_distributed, vault_balance);
+}
+
+;; User stake data storage (stored in separate contract dictionary)
+;; Format: address -> (staked_amount, rewards_earned, rewards_claimed, tier, 
+;;                      stake_timestamp, last_stake_timestamp, last_claim_timestamp, locked_until)
+(cell) get_user_stakes_dict() {
+    slice cs = get_data().begin_parse();
+    cs~skip_bits(158 + 267 + 257 + 64 + 248 + 124); ;; Skip main data
+    if (cs.slice_bits() > 0) {
+        return cs~load_dict();
+    }
+    return new_dict();
+}
+
+() save_user_stake(slice user_addr, int staked_amount, int rewards_earned, 
+                   int rewards_claimed, int tier, int stake_timestamp,
+                   int last_stake_timestamp, int last_claim_timestamp, int locked_until) impure {
+    cell user_stakes = get_user_stakes_dict();
+    
+    user_stakes~udict_set(256, slice_hash(user_addr), begin_cell()
+        .store_uint(staked_amount, 124)
+        .store_uint(rewards_earned, 124)
+        .store_uint(rewards_claimed, 124)
+        .store_uint(tier, 8)
+        .store_uint(stake_timestamp, 64)
+        .store_uint(last_stake_timestamp, 64)
+        .store_uint(last_claim_timestamp, 64)
+        .store_uint(locked_until, 64)
+        .end_cell().begin_parse());
+        
+    ;; Rebuild full storage with user stakes dict
+    (int initialized, int paused, int total_users, int total_staked, slice authority,
+     slice defai_jetton_wallet, slice pending_authority, int has_pending,
+     int authority_timestamp, int escrow_balance, int escrow_distributed, int vault_balance) = load_data();
+     
+    set_data(begin_cell()
+        .store_uint(initialized, 1)
+        .store_uint(paused, 1)
+        .store_uint(total_users, 32)
+        .store_uint(total_staked, 124)
+        .store_slice(authority)
+        .store_slice(defai_jetton_wallet)
+        .store_uint(has_pending, 1)
+        .store_slice(pending_authority)
+        .store_uint(authority_timestamp, 64)
+        .store_uint(escrow_balance, 124)
+        .store_uint(escrow_distributed, 124)
+        .store_uint(vault_balance, 124)
+        .store_dict(user_stakes)
+        .end_cell());
+}
+
+(int, int, int, int, int, int, int, int, int) load_user_stake(slice user_addr) {
+    cell user_stakes = get_user_stakes_dict();
+    (slice stake_data, int found) = user_stakes.udict_get?(256, slice_hash(user_addr));
+    
+    if (~ found) {
+        return (0, 0, 0, 0, 0, 0, 0, 0, 0); ;; Return zeros + not found flag
+    }
+    
+    return (stake_data~load_uint(124),  ;; staked_amount
+            stake_data~load_uint(124),  ;; rewards_earned
+            stake_data~load_uint(124),  ;; rewards_claimed
+            stake_data~load_uint(8),    ;; tier
+            stake_data~load_uint(64),   ;; stake_timestamp
+            stake_data~load_uint(64),   ;; last_stake_timestamp
+            stake_data~load_uint(64),   ;; last_claim_timestamp
+            stake_data~load_uint(64),   ;; locked_until
+            -1);                         ;; found flag
+}
+
+;; ==================== TIER FUNCTIONS ====================
+
+(int) get_tier(int amount) {
+    if (amount >= INFINITE_MIN) {
+        return 3; ;; Infinite tier
+    }
+    if (amount >= TITANIUM_MIN) {
+        return 2; ;; Titanium tier
+    }
+    if (amount >= GOLD_MIN) {
+        return 1; ;; Gold tier
+    }
+    return 0; ;; No tier
+}
+
+(int) get_tier_apy_bps(int amount) {
+    if (amount >= INFINITE_MIN) {
+        return INFINITE_APY_BPS;
+    }
+    if (amount >= TITANIUM_MIN) {
+        return TITANIUM_APY_BPS;
+    }
+    if (amount >= GOLD_MIN) {
+        return GOLD_APY_BPS;
+    }
+    throw(error::amount_too_low);
+    return 0;
+}
+
+;; ==================== CALCULATION FUNCTIONS ====================
+
+(int) calculate_rewards(int staked_amount, int tier_apy_bps, int last_claim_timestamp, int current_timestamp) {
+    int time_elapsed = current_timestamp - last_claim_timestamp;
+    if (time_elapsed <= 0) {
+        return 0;
+    }
+    
+    ;; rewards = (staked_amount * tier_apy_bps * time_elapsed) / (SECONDS_PER_YEAR * BASIS_POINTS)
+    ;; Using muldiv to prevent overflow
+    int rewards = muldiv(staked_amount, tier_apy_bps * time_elapsed, SECONDS_PER_YEAR * BASIS_POINTS);
+    return rewards;
+}
+
+(int) calculate_unstake_penalty(int last_stake_timestamp, int current_timestamp, int amount) {
+    int days_staked = (current_timestamp - last_stake_timestamp) / 86400;
+    
+    int penalty_bps = 0;
+    if (days_staked < 30) {
+        penalty_bps = 200; ;; 2%
+    } elseif (days_staked < 90) {
+        penalty_bps = 100; ;; 1%
+    }
+    
+    if (penalty_bps == 0) {
+        return 0;
+    }
+    
+    return muldiv(amount, penalty_bps, BASIS_POINTS);
+}
+
+;; ==================== MAIN MESSAGE HANDLERS ====================
+
+() handle_stake(slice sender_addr, int amount, int query_id) impure {
+    ;; Load contract state
+    (int initialized, int paused, int total_users, int total_staked, slice authority,
+     slice defai_jetton_wallet, slice pending_authority, int has_pending,
+     int authority_timestamp, int escrow_balance, int escrow_distributed, int vault_balance) = load_data();
+    
+    ;; Validations
+    throw_unless(error::not_initialized, initialized);
+    throw_if(error::program_paused, paused);
+    throw_unless(error::amount_too_low, amount >= GOLD_MIN);
+    
+    ;; Load user stake data
+    (int staked_amount, int rewards_earned, int rewards_claimed, int tier,
+     int stake_timestamp, int last_stake_timestamp, int last_claim_timestamp,
+     int locked_until, int found) = load_user_stake(sender_addr);
+    
+    int current_time = now();
+    int new_total_users = total_users;
+    
+    if (~ found) {
+        ;; New user staking
+        new_total_users = total_users + 1;
+        staked_amount = amount;
+        stake_timestamp = current_time;
+        last_stake_timestamp = current_time;
+        last_claim_timestamp = current_time;
+        locked_until = current_time + INITIAL_LOCK_PERIOD;
+        rewards_earned = 0;
+        rewards_claimed = 0;
+    } else {
+        ;; Existing user adding stake
+        ;; Calculate pending rewards before adding new stake
+        int pending_rewards = calculate_rewards(
+            staked_amount, 
+            get_tier_apy_bps(staked_amount),
+            last_claim_timestamp,
+            current_time
+        );
+        
+        rewards_earned = rewards_earned + pending_rewards;
+        staked_amount = staked_amount + amount;
+        last_claim_timestamp = current_time;
+        last_stake_timestamp = current_time;
+        locked_until = current_time + INITIAL_LOCK_PERIOD;
+    }
+    
+    ;; Update tier
+    tier = get_tier(staked_amount);
+    
+    ;; Update global state
+    total_staked = total_staked + amount;
+    vault_balance = vault_balance + amount;
+    
+    ;; Save updated state
+    save_data(initialized, paused, new_total_users, total_staked, authority,
+              defai_jetton_wallet, pending_authority, has_pending,
+              authority_timestamp, escrow_balance, escrow_distributed, vault_balance);
+              
+    save_user_stake(sender_addr, staked_amount, rewards_earned, rewards_claimed,
+                    tier, stake_timestamp, last_stake_timestamp, last_claim_timestamp, locked_until);
+}
+
+() handle_unstake(slice sender_addr, int amount, int query_id) impure {
+    ;; Load contract state
+    (int initialized, int paused, int total_users, int total_staked, slice authority,
+     slice defai_jetton_wallet, slice pending_authority, int has_pending,
+     int authority_timestamp, int escrow_balance, int escrow_distributed, int vault_balance) = load_data();
+    
+    ;; Validations
+    throw_unless(error::not_initialized, initialized);
+    throw_if(error::program_paused, paused);
+    
+    ;; Load user stake
+    (int staked_amount, int rewards_earned, int rewards_claimed, int tier,
+     int stake_timestamp, int last_stake_timestamp, int last_claim_timestamp,
+     int locked_until, int found) = load_user_stake(sender_addr);
+    
+    throw_unless(error::insufficient_stake, found & (staked_amount >= amount));
+    
+    int current_time = now();
+    throw_unless(error::tokens_locked, current_time >= locked_until);
+    
+    ;; Calculate pending rewards
+    int pending_rewards = calculate_rewards(
+        staked_amount,
+        get_tier_apy_bps(staked_amount),
+        last_claim_timestamp,
+        current_time
+    );
+    rewards_earned = rewards_earned + pending_rewards;
+    last_claim_timestamp = current_time;
+    
+    ;; Calculate penalty
+    int penalty = calculate_unstake_penalty(last_stake_timestamp, current_time, amount);
+    int amount_after_penalty = amount - penalty;
+    
+    ;; Update balances
+    staked_amount = staked_amount - amount;
+    total_staked = total_staked - amount;
+    vault_balance = vault_balance - amount;
+    
+    ;; If penalty exists, add to escrow
+    if (penalty > 0) {
+        escrow_balance = escrow_balance + penalty;
+    }
+    
+    ;; Update tier
+    tier = get_tier(staked_amount);
+    
+    ;; Save state
+    save_data(initialized, paused, total_users, total_staked, authority,
+              defai_jetton_wallet, pending_authority, has_pending,
+              authority_timestamp, escrow_balance, escrow_distributed, vault_balance);
+              
+    save_user_stake(sender_addr, staked_amount, rewards_earned, rewards_claimed,
+                    tier, stake_timestamp, last_stake_timestamp, last_claim_timestamp, locked_until);
+    
+    ;; Send tokens back to user (handled by jetton transfer message)
+    ;; This would trigger a jetton transfer in the actual implementation
+}
+
+() handle_claim_rewards(slice sender_addr, int query_id) impure {
+    ;; Load contract state
+    (int initialized, int paused, int total_users, int total_staked, slice authority,
+     slice defai_jetton_wallet, slice pending_authority, int has_pending,
+     int authority_timestamp, int escrow_balance, int escrow_distributed, int vault_balance) = load_data();
+    
+    throw_unless(error::not_initialized, initialized);
+    throw_if(error::program_paused, paused);
+    
+    ;; Load user stake
+    (int staked_amount, int rewards_earned, int rewards_claimed, int tier,
+     int stake_timestamp, int last_stake_timestamp, int last_claim_timestamp,
+     int locked_until, int found) = load_user_stake(sender_addr);
+    
+    throw_unless(error::insufficient_stake, found);
+    
+    int current_time = now();
+    
+    ;; Calculate pending rewards
+    int pending_rewards = calculate_rewards(
+        staked_amount,
+        get_tier_apy_bps(staked_amount),
+        last_claim_timestamp,
+        current_time
+    );
+    
+    int total_claimable = rewards_earned + pending_rewards - rewards_claimed;
+    throw_unless(error::no_rewards, total_claimable > 0);
+    throw_unless(error::insufficient_escrow, escrow_balance >= total_claimable);
+    
+    ;; Update state
+    rewards_earned = rewards_earned + pending_rewards;
+    rewards_claimed = rewards_claimed + total_claimable;
+    last_claim_timestamp = current_time;
+    
+    escrow_balance = escrow_balance - total_claimable;
+    escrow_distributed = escrow_distributed + total_claimable;
+    
+    ;; Save state
+    save_data(initialized, paused, total_users, total_staked, authority,
+              defai_jetton_wallet, pending_authority, has_pending,
+              authority_timestamp, escrow_balance, escrow_distributed, vault_balance);
+              
+    save_user_stake(sender_addr, staked_amount, rewards_earned, rewards_claimed,
+                    tier, stake_timestamp, last_stake_timestamp, last_claim_timestamp, locked_until);
+}
+
+() handle_compound_rewards(slice sender_addr, int query_id) impure {
+    ;; Load contract state
+    (int initialized, int paused, int total_users, int total_staked, slice authority,
+     slice defai_jetton_wallet, slice pending_authority, int has_pending,
+     int authority_timestamp, int escrow_balance, int escrow_distributed, int vault_balance) = load_data();
+    
+    throw_unless(error::not_initialized, initialized);
+    throw_if(error::program_paused, paused);
+    
+    ;; Load user stake
+    (int staked_amount, int rewards_earned, int rewards_claimed, int tier,
+     int stake_timestamp, int last_stake_timestamp, int last_claim_timestamp,
+     int locked_until, int found) = load_user_stake(sender_addr);
+    
+    throw_unless(error::insufficient_stake, found);
+    
+    int current_time = now();
+    
+    ;; Calculate pending rewards
+    int pending_rewards = calculate_rewards(
+        staked_amount,
+        get_tier_apy_bps(staked_amount),
+        last_claim_timestamp,
+        current_time
+    );
+    
+    int total_unclaimed = rewards_earned + pending_rewards - rewards_claimed;
+    throw_unless(error::no_rewards, total_unclaimed > 0);
+    throw_unless(error::insufficient_escrow, escrow_balance >= total_unclaimed);
+    
+    ;; Compound rewards into stake
+    staked_amount = staked_amount + total_unclaimed;
+    rewards_earned = rewards_earned + pending_rewards;
+    rewards_claimed = rewards_earned; ;; Mark all as claimed
+    last_claim_timestamp = current_time;
+    
+    ;; Update tier
+    tier = get_tier(staked_amount);
+    
+    ;; Update global state
+    total_staked = total_staked + total_unclaimed;
+    vault_balance = vault_balance + total_unclaimed;
+    escrow_balance = escrow_balance - total_unclaimed;
+    escrow_distributed = escrow_distributed + total_unclaimed;
+    
+    ;; Save state
+    save_data(initialized, paused, total_users, total_staked, authority,
+              defai_jetton_wallet, pending_authority, has_pending,
+              authority_timestamp, escrow_balance, escrow_distributed, vault_balance);
+              
+    save_user_stake(sender_addr, staked_amount, rewards_earned, rewards_claimed,
+                    tier, stake_timestamp, last_stake_timestamp, last_claim_timestamp, locked_until);
+}
+
+() handle_fund_escrow(slice sender_addr, int amount, int query_id) impure {
+    ;; Load contract state
+    (int initialized, int paused, int total_users, int total_staked, slice authority,
+     slice defai_jetton_wallet, slice pending_authority, int has_pending,
+     int authority_timestamp, int escrow_balance, int escrow_distributed, int vault_balance) = load_data();
+    
+    throw_unless(error::not_initialized, initialized);
+    
+    ;; Update escrow balance
+    escrow_balance = escrow_balance + amount;
+    
+    ;; Save state
+    save_data(initialized, paused, total_users, total_staked, authority,
+              defai_jetton_wallet, pending_authority, has_pending,
+              authority_timestamp, escrow_balance, escrow_distributed, vault_balance);
+}
+
+;; ==================== ADMIN FUNCTIONS ====================
+
+() handle_initialize(slice sender_addr, slice defai_jetton_wallet, int query_id) impure {
+    ;; Load current state to check if already initialized
+    (int initialized, _, _, _, _, _, _, _, _, _, _, _) = load_data();
+    throw_if(error::already_initialized, initialized);
+    
+    ;; Initialize contract
+    save_data(
+        -1,                    ;; initialized = true
+        0,                     ;; paused = false
+        0,                     ;; total_users = 0
+        0,                     ;; total_staked = 0
+        sender_addr,           ;; authority
+        defai_jetton_wallet,   ;; defai jetton wallet
+        sender_addr,           ;; pending_authority (set to current for now)
+        0,                     ;; has_pending = false
+        0,                     ;; authority_timestamp = 0
+        0,                     ;; escrow_balance = 0
+        0,                     ;; escrow_distributed = 0
+        0                      ;; vault_balance = 0
+    );
+}
+
+() handle_propose_authority_change(slice sender_addr, slice new_authority, int query_id) impure {
+    ;; Load contract state
+    (int initialized, int paused, int total_users, int total_staked, slice authority,
+     slice defai_jetton_wallet, slice pending_authority, int has_pending,
+     int authority_timestamp, int escrow_balance, int escrow_distributed, int vault_balance) = load_data();
+    
+    throw_unless(error::not_initialized, initialized);
+    throw_unless(error::unauthorized, equal_slices(sender_addr, authority));
+    
+    ;; Set pending authority with timelock
+    pending_authority = new_authority;
+    has_pending = -1;
+    authority_timestamp = now() + ADMIN_TIMELOCK_DURATION;
+    
+    ;; Save state
+    save_data(initialized, paused, total_users, total_staked, authority,
+              defai_jetton_wallet, pending_authority, has_pending,
+              authority_timestamp, escrow_balance, escrow_distributed, vault_balance);
+}
+
+() handle_accept_authority_change(slice sender_addr, int query_id) impure {
+    ;; Load contract state
+    (int initialized, int paused, int total_users, int total_staked, slice authority,
+     slice defai_jetton_wallet, slice pending_authority, int has_pending,
+     int authority_timestamp, int escrow_balance, int escrow_distributed, int vault_balance) = load_data();
+    
+    throw_unless(error::not_initialized, initialized);
+    throw_unless(error::unauthorized, equal_slices(sender_addr, authority));
+    throw_unless(error::no_pending_authority, has_pending);
+    throw_unless(error::timelock_active, now() >= authority_timestamp);
+    
+    ;; Update authority
+    authority = pending_authority;
+    has_pending = 0;
+    authority_timestamp = 0;
+    
+    ;; Save state
+    save_data(initialized, paused, total_users, total_staked, authority,
+              defai_jetton_wallet, pending_authority, has_pending,
+              authority_timestamp, escrow_balance, escrow_distributed, vault_balance);
+}
+
+() handle_pause(slice sender_addr, int pause_state, int query_id) impure {
+    ;; Load contract state
+    (int initialized, int paused, int total_users, int total_staked, slice authority,
+     slice defai_jetton_wallet, slice pending_authority, int has_pending,
+     int authority_timestamp, int escrow_balance, int escrow_distributed, int vault_balance) = load_data();
+    
+    throw_unless(error::not_initialized, initialized);
+    throw_unless(error::unauthorized, equal_slices(sender_addr, authority));
+    
+    ;; Update pause state
+    paused = pause_state;
+    
+    ;; Save state
+    save_data(initialized, paused, total_users, total_staked, authority,
+              defai_jetton_wallet, pending_authority, has_pending,
+              authority_timestamp, escrow_balance, escrow_distributed, vault_balance);
+}
+
+;; ==================== MAIN RECEIVER ====================
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+    
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    
+    if (flags & 1) { ;; Ignore bounced messages
+        return ();
+    }
+    
+    slice sender_addr = cs~load_msg_addr();
+    
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+    
+    if (op == op::initialize) {
+        slice defai_jetton_wallet = in_msg_body~load_msg_addr();
+        handle_initialize(sender_addr, defai_jetton_wallet, query_id);
+        return ();
+    }
+    
+    if (op == op::stake) {
+        int amount = in_msg_body~load_coins();
+        handle_stake(sender_addr, amount, query_id);
+        return ();
+    }
+    
+    if (op == op::unstake) {
+        int amount = in_msg_body~load_coins();
+        handle_unstake(sender_addr, amount, query_id);
+        return ();
+    }
+    
+    if (op == op::claim_rewards) {
+        handle_claim_rewards(sender_addr, query_id);
+        return ();
+    }
+    
+    if (op == op::compound_rewards) {
+        handle_compound_rewards(sender_addr, query_id);
+        return ();
+    }
+    
+    if (op == op::fund_escrow) {
+        int amount = in_msg_body~load_coins();
+        handle_fund_escrow(sender_addr, amount, query_id);
+        return ();
+    }
+    
+    if (op == op::propose_authority) {
+        slice new_authority = in_msg_body~load_msg_addr();
+        handle_propose_authority_change(sender_addr, new_authority, query_id);
+        return ();
+    }
+    
+    if (op == op::accept_authority) {
+        handle_accept_authority_change(sender_addr, query_id);
+        return ();
+    }
+    
+    if (op == op::pause) {
+        int pause_state = in_msg_body~load_uint(1);
+        handle_pause(sender_addr, pause_state, query_id);
+        return ();
+    }
+    
+    throw(0xffff); ;; Unknown op
+}
+
+;; ==================== GET METHODS ====================
+
+(int, int, int, int, slice) get_contract_state() method_id {
+    (int initialized, int paused, int total_users, int total_staked, slice authority,
+     _, _, _, _, _, _, _) = load_data();
+    return (initialized, paused, total_users, total_staked, authority);
+}
+
+(int, int, int, int) get_escrow_info() method_id {
+    (_, _, _, _, _, _, _, _, _, int escrow_balance, int escrow_distributed, int vault_balance) = load_data();
+    return (escrow_balance, escrow_distributed, vault_balance, escrow_balance > 0 ? muldiv(escrow_distributed, 100, escrow_balance) : 0);
+}
+
+(int, int, int, int, int, int, int, int) get_user_stake_info(slice user_addr) method_id {
+    (int staked_amount, int rewards_earned, int rewards_claimed, int tier,
+     int stake_timestamp, int last_stake_timestamp, int last_claim_timestamp,
+     int locked_until, int found) = load_user_stake(user_addr);
+     
+    if (~ found) {
+        return (0, 0, 0, 0, 0, 0, 0, 0);
+    }
+    
+    return (staked_amount, rewards_earned, rewards_claimed, tier,
+            stake_timestamp, last_stake_timestamp, last_claim_timestamp, locked_until);
+}
+
+(int) get_pending_rewards(slice user_addr) method_id {
+    (int staked_amount, int rewards_earned, int rewards_claimed, _,
+     _, _, int last_claim_timestamp, _, int found) = load_user_stake(user_addr);
+     
+    if (~ found) {
+        return 0;
+    }
+    
+    int pending = calculate_rewards(
+        staked_amount,
+        get_tier_apy_bps(staked_amount),
+        last_claim_timestamp,
+        now()
+    );
+    
+    return rewards_earned + pending - rewards_claimed;
+}
+
+(int, slice) get_pending_authority() method_id {
+    (_, _, _, _, _, _, slice pending_authority, int has_pending,
+     int authority_timestamp, _, _, _) = load_data();
+     
+    if (~ has_pending) {
+        return (0, pending_authority);
+    }
+    
+    return (authority_timestamp, pending_authority);
+}
+
+(int) get_tier_for_amount(int amount) method_id {
+    return get_tier(amount);
+}
+
+(int) get_apy_for_amount(int amount) method_id {
+    if (amount < GOLD_MIN) {
+        return 0;
+    }
+    return get_tier_apy_bps(amount);
+}

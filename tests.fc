@@ -1,0 +1,188 @@
+#pragma version >=0.4.0;
+
+;; DeFAI Staking Contract Test Suite
+
+#include "defai_staking.fc";
+
+;; ==================== TEST HELPERS ====================
+
+(int) test_equal(int a, int b, slice test_name) {
+    if (a == b) {
+        ~strdump("✓ PASS: ");
+        ~strdump(test_name);
+        return -1;
+    } else {
+        ~strdump("✗ FAIL: ");
+        ~strdump(test_name);
+        ~dump(a);
+        ~dump(b);
+        return 0;
+    }
+}
+
+(int) test_assert(int condition, slice test_name) {
+    if (condition) {
+        ~strdump("✓ PASS: ");
+        ~strdump(test_name);
+        return -1;
+    } else {
+        ~strdump("✗ FAIL: ");
+        ~strdump(test_name);
+        return 0;
+    }
+}
+
+;; ==================== TIER TESTS ====================
+
+() test_tier_calculations() {
+    ~strdump("=== Testing Tier Calculations ===");
+    
+    ;; Test Gold tier
+    test_equal(get_tier(10000000000000000), 1, "Gold tier min");
+    test_equal(get_tier(50000000000000000), 1, "Gold tier mid");
+    test_equal(get_tier(99999999000000000), 1, "Gold tier max");
+    
+    ;; Test Titanium tier
+    test_equal(get_tier(100000000000000000), 2, "Titanium tier min");
+    test_equal(get_tier(500000000000000000), 2, "Titanium tier mid");
+    test_equal(get_tier(999999999000000000), 2, "Titanium tier max");
+    
+    ;; Test Infinite tier
+    test_equal(get_tier(1000000000000000000), 3, "Infinite tier min");
+    test_equal(get_tier(5000000000000000000), 3, "Infinite tier high");
+    
+    ;; Test no tier
+    test_equal(get_tier(1000000000000000), 0, "Below minimum - no tier");
+}
+
+() test_apy_calculations() {
+    ~strdump("=== Testing APY Calculations ===");
+    
+    ;; Test Gold APY
+    test_equal(get_tier_apy_bps(10000000000000000), 50, "Gold APY = 50 bps");
+    test_equal(get_tier_apy_bps(50000000000000000), 50, "Gold APY mid = 50 bps");
+    
+    ;; Test Titanium APY
+    test_equal(get_tier_apy_bps(100000000000000000), 75, "Titanium APY = 75 bps");
+    test_equal(get_tier_apy_bps(500000000000000000), 75, "Titanium APY mid = 75 bps");
+    
+    ;; Test Infinite APY
+    test_equal(get_tier_apy_bps(1000000000000000000), 100, "Infinite APY = 100 bps");
+    test_equal(get_tier_apy_bps(5000000000000000000), 100, "Infinite APY high = 100 bps");
+}
+
+;; ==================== REWARD CALCULATION TESTS ====================
+
+() test_reward_calculations() {
+    ~strdump("=== Testing Reward Calculations ===");
+    
+    ;; Test 1 year rewards for Gold tier (10M DEFAI at 0.5% APY)
+    int gold_stake = 10000000000000000;
+    int gold_rewards_1y = calculate_rewards(gold_stake, 50, 0, SECONDS_PER_YEAR);
+    int expected_gold_1y = 50000000000000; ;; 0.5% of 10M = 50k
+    test_equal(gold_rewards_1y, expected_gold_1y, "Gold tier 1 year rewards");
+    
+    ;; Test 6 months rewards for Titanium tier (100M DEFAI at 0.75% APY)
+    int titanium_stake = 100000000000000000;
+    int titanium_rewards_6m = calculate_rewards(titanium_stake, 75, 0, SECONDS_PER_YEAR / 2);
+    int expected_titanium_6m = 375000000000000; ;; 0.375% of 100M = 375k
+    test_equal(titanium_rewards_6m, expected_titanium_6m, "Titanium tier 6 month rewards");
+    
+    ;; Test 30 days rewards for Infinite tier (1B DEFAI at 1% APY)
+    int infinite_stake = 1000000000000000000;
+    int infinite_rewards_30d = calculate_rewards(infinite_stake, 100, 0, 2592000); ;; 30 days
+    int expected_infinite_30d = 821917000000000; ;; ~0.0822% of 1B = ~821k
+    test_assert(infinite_rewards_30d > 800000000000000, "Infinite tier 30 day rewards > 800k");
+    test_assert(infinite_rewards_30d < 850000000000000, "Infinite tier 30 day rewards < 850k");
+}
+
+;; ==================== PENALTY CALCULATION TESTS ====================
+
+() test_penalty_calculations() {
+    ~strdump("=== Testing Penalty Calculations ===");
+    
+    int amount = 100000000000000000; ;; 100M DEFAI
+    
+    ;; Test < 30 days penalty (2%)
+    int penalty_10d = calculate_unstake_penalty(0, 864000, amount); ;; 10 days
+    int expected_10d = 2000000000000000; ;; 2% of 100M = 2M
+    test_equal(penalty_10d, expected_10d, "10 days unstake penalty = 2%");
+    
+    ;; Test 30-90 days penalty (1%)
+    int penalty_45d = calculate_unstake_penalty(0, 3888000, amount); ;; 45 days
+    int expected_45d = 1000000000000000; ;; 1% of 100M = 1M
+    test_equal(penalty_45d, expected_45d, "45 days unstake penalty = 1%");
+    
+    ;; Test > 90 days penalty (0%)
+    int penalty_100d = calculate_unstake_penalty(0, 8640000, amount); ;; 100 days
+    test_equal(penalty_100d, 0, "100 days unstake penalty = 0%");
+}
+
+;; ==================== STORAGE TESTS ====================
+
+() test_storage_operations() {
+    ~strdump("=== Testing Storage Operations ===");
+    
+    ;; Test initial save and load
+    slice test_authority = begin_cell().store_uint(1, 2).store_uint(0, 8).store_uint(12345, 256).end_cell().begin_parse();
+    slice test_jetton = begin_cell().store_uint(1, 2).store_uint(0, 8).store_uint(67890, 256).end_cell().begin_parse();
+    
+    save_data(-1, 0, 100, 1000000000000000000, test_authority, test_jetton,
+              test_authority, 0, 0, 500000000000000, 100000000000000, 900000000000000);
+    
+    (int initialized, int paused, int total_users, int total_staked, slice authority,
+     slice jetton, slice pending, int has_pending, int timestamp,
+     int escrow_bal, int escrow_dist, int vault_bal) = load_data();
+    
+    test_equal(initialized, -1, "Storage: initialized flag");
+    test_equal(paused, 0, "Storage: paused flag");
+    test_equal(total_users, 100, "Storage: total users");
+    test_equal(total_staked, 1000000000000000000, "Storage: total staked");
+    test_equal(escrow_bal, 500000000000000, "Storage: escrow balance");
+    test_equal(vault_bal, 900000000000000, "Storage: vault balance");
+}
+
+;; ==================== INTEGRATION TESTS ====================
+
+() test_staking_flow() {
+    ~strdump("=== Testing Staking Flow ===");
+    
+    ;; Initialize contract
+    slice admin = begin_cell().store_uint(1, 2).store_uint(0, 8).store_uint(111, 256).end_cell().begin_parse();
+    slice jetton = begin_cell().store_uint(1, 2).store_uint(0, 8).store_uint(222, 256).end_cell().begin_parse();
+    
+    save_data(0, 0, 0, 0, admin, jetton, admin, 0, 0, 0, 0, 0);
+    
+    ;; Simulate initialization
+    handle_initialize(admin, jetton, 1);
+    
+    (int initialized, _, _, _, _, _, _, _, _, _, _, _) = load_data();
+    test_equal(initialized, -1, "Contract initialized");
+    
+    ;; Simulate staking
+    slice user1 = begin_cell().store_uint(1, 2).store_uint(0, 8).store_uint(333, 256).end_cell().begin_parse();
+    int stake_amount = 100000000000000000; ;; 100M DEFAI
+    
+    ;; Note: In real tests, we'd need to mock time and handle the full flow
+    ;; This is a simplified version to show the structure
+    ~strdump("Staking flow test structure ready");
+}
+
+;; ==================== RUN ALL TESTS ====================
+
+() run_all_tests() method_id {
+    ~strdump("====================================");
+    ~strdump("DeFAI Staking Contract Test Suite");
+    ~strdump("====================================");
+    
+    test_tier_calculations();
+    test_apy_calculations();
+    test_reward_calculations();
+    test_penalty_calculations();
+    test_storage_operations();
+    test_staking_flow();
+    
+    ~strdump("====================================");
+    ~strdump("All tests completed!");
+    ~strdump("====================================");
+}
